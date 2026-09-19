@@ -1,0 +1,22 @@
+{
+  "name": "cinecast-bot",
+  "version": "1.0.0",
+  "description": "Telegram-бот для совместного просмотра фильмов и видео: RTMP-трансляция YouTube/VK Video в видеочат группы",
+  "type": "module",
+  "main": "bot.js",
+  "engines": {
+    "node": ">=20.11"
+  },
+  "scripts": {
+    "start": "node bot.js",
+    "login": "node bot.js login",
+    "doctor": "node bot.js doctor"
+  },
+  "dependencies": {
+    "better-sqlite3": "^13.0.3",
+    "dotenv": "^18.0.1",
+    "grammy": "^1.46.0",
+    "teleproto": "^1.229.0"
+  },
+  "license": "MIT"
+}
