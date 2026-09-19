@@ -49,7 +49,8 @@ const CFG = {
     .filter(Boolean)
     .map(Number),
 
-  DB_PATH: process.env.DB_PATH || path.join(__dirname, 'data', 'cinecast.db'),
+  // Некоторые панели дают постоянный том через DATA_DIR (обычно /app/data)
+  DB_PATH: process.env.DB_PATH || path.join(process.env.DATA_DIR || path.join(__dirname, 'data'), 'cinecast.db'),
 
   FFMPEG: process.env.FFMPEG_PATH || 'ffmpeg',
   FFPROBE: process.env.FFPROBE_PATH || 'ffprobe',
@@ -307,6 +308,7 @@ const Q = {
 
   metaGet: db.prepare('SELECT value FROM meta WHERE key = ?'),
   metaSet: db.prepare('INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value'),
+  metaDel: db.prepare('DELETE FROM meta WHERE key = ?'),
 };
 
 Q.hangingSessions.run(Date.now());
@@ -438,9 +440,26 @@ async function loadMtLib() {
   throw new Error('MTPROTO_LIB_MISSING');
 }
 
+/**
+ * Строка сессии: переменная окружения имеет приоритет, иначе — то, что
+ * сохранено в БД (вход через админ-меню бота, когда на хостинге нет shell).
+ */
+function sessionString() {
+  if (CFG.MTPROTO_SESSION) return CFG.MTPROTO_SESSION;
+  try { return Q.metaGet.get('mtproto_session')?.value || ''; } catch { return ''; }
+}
+const sessionSource = () => (CFG.MTPROTO_SESSION ? 'env' : Q.metaGet.get('mtproto_session')?.value ? 'база' : null);
+
+/** Сбрасывает подключение, чтобы следующий вызов поднял новую сессию. */
+function resetMt() {
+  try { mtproto?.client?.disconnect(); } catch {}
+  mtproto = null;
+  mtprotoReady = null;
+}
+
 async function getMt() {
   if (mtproto) return mtproto;
-  if (!CFG.API_ID || !CFG.API_HASH || !CFG.MTPROTO_SESSION) {
+  if (!CFG.API_ID || !CFG.API_HASH || !sessionString()) {
     throw new Error('MTPROTO_NOT_CONFIGURED');
   }
   if (!mtprotoReady) {
@@ -449,7 +468,7 @@ async function getMt() {
       const { TelegramClient, Api, Logger } = lib;
       const { StringSession } = sessions;
       const client = new TelegramClient(
-        new StringSession(CFG.MTPROTO_SESSION),
+        new StringSession(sessionString()),
         CFG.API_ID,
         CFG.API_HASH,
         {
@@ -521,6 +540,144 @@ async function ensureRtmp(chat, { revoke = false, title } = {}) {
   const res = await client.invoke(new Api.phone.GetGroupCallStreamRtmpUrl({ peer, revoke }));
   Q.saveRtmp.run(res.url, res.key, now(), chat.id);
   return { url: res.url, key: res.key, call };
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   7b. ВХОД В АККАУНТ-ВЕЩАТЕЛЬ ПРЯМО ИЗ TELEGRAM
+   ──────────────────────────────────────────────────────────────────────────
+   Нужен там, где панель хостинга не даёт shell и `node bot.js login`
+   выполнить негде. Сессия сохраняется в таблицу meta (том /app/data).
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/** userId -> состояние интерактивного входа */
+const mtLogin = new Map();
+
+function deferred() {
+  let resolve, reject;
+  const p = new Promise((res, rej) => { resolve = res; reject = rej; });
+  return { p, resolve, reject };
+}
+
+function saveSessionString(str) {
+  Q.metaSet.run('mtproto_session', str);
+  Q.metaSet.run('mtproto_saved_at', String(now()));
+  resetMt();
+}
+
+/** Запускает диалог входа: номер → код → 2FA. */
+async function beginMtLogin(userId, chatId) {
+  if (!CFG.API_ID || !CFG.API_HASH) throw new Error('NO_API_CREDENTIALS');
+  if (mtLogin.has(userId)) throw new Error('LOGIN_IN_PROGRESS');
+
+  const { lib, sessions } = await loadMtLib();
+  const client = new lib.TelegramClient(
+    new sessions.StringSession(''),
+    CFG.API_ID,
+    CFG.API_HASH,
+    { connectionRetries: 3, ...(lib.Logger ? { baseLogger: new lib.Logger('error') } : {}) },
+  );
+
+  const st = { client, chatId, step: null, pending: null, errors: 0 };
+  mtLogin.set(userId, st);
+
+  const ask = (step, text) => {
+    st.step = step;
+    st.pending = deferred();
+    bot.api.sendMessage(chatId, text, { ...OPTS, reply_markup: kb([btn('Отменить вход', 'a:mtcancel', 'cross')]) })
+      .catch(() => {});
+    return st.pending.p;
+  };
+
+  client
+    .start({
+      phoneNumber: () => ask('phone',
+        `<b>${px('profile')} Шаг 1 — номер телефона</b>\n\n` +
+        `Пришлите номер аккаунта-вещателя в формате <code>+79991234567</code>.\n\n` +
+        `${px('info')} Это должен быть аккаунт, который состоит в ваших группах и имеет право «Управление видеочатами».`),
+      phoneCode: () => ask('code',
+        `<b>${px('clock')} Шаг 2 — код подтверждения</b>\n\n` +
+        `Telegram прислал код в приложение.\n\n` +
+        `${px('cross')} <b>Не присылайте код слитно</b> — Telegram аннулирует коды, отправленные сообщением.\n` +
+        `${px('check')} Пришлите его <b>через дефисы или пробелы</b>: <code>1-2-3-4-5</code>`),
+      password: () => ask('password',
+        `<b>${px('lock')} Шаг 3 — облачный пароль</b>\n\n` +
+        `На аккаунте включена двухфакторная защита. Пришлите пароль.\n\n` +
+        `${px('hidden')} Сообщение с паролем удалю сразу после получения.`),
+      onError: async (e) => {
+        st.errors += 1;
+        await bot.api.sendMessage(chatId,
+          `<b>${px('cross')} Telegram отклонил данные</b>\n<code>${esc(clip(e.message, 160))}</code>` +
+          (st.errors >= 3 ? '' : `\n\n<i>Попробуйте ещё раз.</i>`), OPTS).catch(() => {});
+        return st.errors >= 3; // true — прекратить попытки
+      },
+    })
+    .then(async () => {
+      const str = client.session.save();
+      saveSessionString(str);
+      const me = await client.getMe().catch(() => null);
+      log('info', `Сессия вещателя сохранена (@${me?.username || me?.id || '?'})`);
+      await bot.api.sendMessage(chatId,
+        `<b>${px('check')} Аккаунт-вещатель подключён</b>\n\n` +
+        `${px('profile')} ${me ? esc(me.firstName || '') + (me.username ? ` (@${esc(me.username)})` : '') : '—'}\n` +
+        `${px('file')} Сессия сохранена в базе — переживёт перезапуск контейнера.\n\n` +
+        `${px('info')} Надёжнее хранить её в переменной <code>MTPROTO_SESSION</code> панели хостинга. ` +
+        `Строку можно выгрузить кнопкой ниже.`,
+        { ...OPTS, reply_markup: kb(
+          [btn('Показать строку сессии', 'a:mtexport', 'eye')],
+          [btn('К вещателю', 'a:mt', 'settings')],
+        ) }).catch(() => {});
+    })
+    .catch(async (e) => {
+      const msg = /CANCELLED/.test(e.message) ? 'Вход отменён.' : humanError(e);
+      await bot.api.sendMessage(chatId,
+        `<b>${px('cross')} Вход не завершён</b>\n\n<code>${esc(clip(msg, 200))}</code>`,
+        { ...OPTS, reply_markup: kb([btn('Ещё раз', 'a:mtlogin', 'loading')], [btn('Назад', 'a:mt')]) }).catch(() => {});
+    })
+    .finally(() => {
+      mtLogin.delete(userId);
+      try { client.disconnect(); } catch {}
+    });
+}
+
+/** Передаёт введённое значение в ожидающий шаг входа. */
+function feedMtLogin(userId, raw) {
+  const st = mtLogin.get(userId);
+  if (!st?.pending) return false;
+  let v = String(raw).trim();
+  if (st.step === 'code') v = v.replace(/\D/g, '');
+  if (st.step === 'phone') v = v.replace(/[^\d+]/g, '');
+  const pending = st.pending;
+  st.pending = null;
+  pending.resolve(v);
+  return true;
+}
+
+function cancelMtLogin(userId) {
+  const st = mtLogin.get(userId);
+  if (!st) return false;
+  st.pending?.reject(new Error('CANCELLED'));
+  mtLogin.delete(userId);
+  try { st.client.disconnect(); } catch {}
+  return true;
+}
+
+/** Проверяет произвольную строку сессии и сохраняет её при успехе. */
+async function adoptSessionString(str) {
+  const { lib, sessions } = await loadMtLib();
+  const client = new lib.TelegramClient(
+    new sessions.StringSession(str.trim()),
+    CFG.API_ID,
+    CFG.API_HASH,
+    { connectionRetries: 2, ...(lib.Logger ? { baseLogger: new lib.Logger('error') } : {}) },
+  );
+  try {
+    await client.connect();
+    const me = await client.getMe();
+    saveSessionString(str.trim());
+    return me;
+  } finally {
+    try { await client.disconnect(); } catch {}
+  }
 }
 
 async function discardCall(chat) {
@@ -825,7 +982,10 @@ function viewHome(user) {
     `Загружаю YouTube и VK Video прямо в видеочат вашей группы. ` +
     `Все смотрят один поток, синхронно, без задержки на пересылку файлов.\n\n` +
     `${px('growth')} <b>Сейчас в эфире:</b> <code>${liveCount}</code>\n` +
-    `${px('home')} <b>Ваших групп:</b> <code>${Q.listChatsFor.all(user.id, user.id).length}</code>`;
+    `${px('home')} <b>Ваших групп:</b> <code>${Q.listChatsFor.all(user.id, user.id).length}</code>` +
+    (isOwner(user.id) && !sessionSource()
+      ? `\n\n${px('cross')} <b>Аккаунт-вещатель не подключён</b> — без него трансляция не стартует. Команда /login.`
+      : '');
 
   return {
     text,
@@ -1059,9 +1219,37 @@ function viewAdmin() {
       `${px('home')} Групп: <code>${Q.countChats.get().c}</code>\n` +
       `${px('media')} Активных эфиров: <code>${live.size}</code>`,
     kb: kb(
+      [btn('Аккаунт-вещатель', 'a:mt', 'profile')],
       [btn('Рассылка', 'a:bc', 'megaphone'), btn('Все группы', 'a:chats', 'home')],
       [btn('Активные эфиры', 'a:live', 'media'), btn('Диагностика', 'a:doctor', 'code')],
       [back('home')],
+    ),
+  };
+}
+
+function viewMt() {
+  const src = sessionSource();
+  const savedAt = Q.metaGet.get('mtproto_saved_at')?.value;
+  const creds = CFG.API_ID && CFG.API_HASH;
+
+  const text =
+    `<b>${px('profile')} Аккаунт-вещатель</b>\n\n` +
+    `Именно он создаёт RTMP-видеочат и отдаёт ключ трансляции. ` +
+    `Бот сам этого не умеет — Bot API не даёт таких методов.\n\n` +
+    `${creds ? px('check') : px('cross')} <b>API_ID / API_HASH:</b> <code>${creds ? 'заданы' : 'не заданы'}</code>\n` +
+    `${src ? px('check') : px('cross')} <b>Сессия:</b> <code>${src ? (src === 'env' ? 'из переменной окружения' : 'сохранена в базе') : 'нет'}</code>` +
+    (src === 'база' && savedAt ? `\n${px('calendar')} <i>${new Date(Number(savedAt)).toLocaleString('ru-RU')}</i>` : '') +
+    (src === 'env' ? `\n\n${px('info')} Переменная окружения имеет приоритет: чтобы войти заново, очистите <code>MTPROTO_SESSION</code> в панели.` : '') +
+    (creds ? '' : `\n\n${px('cross')} Сначала задайте <code>API_ID</code> и <code>API_HASH</code> (my.telegram.org) в переменных окружения.`);
+
+  return {
+    text,
+    kb: kb(
+      creds ? [btn('Войти по номеру', 'a:mtlogin', 'send')] : null,
+      creds ? [btn('Вставить строку сессии', 'a:mtpaste', 'clip')] : null,
+      src ? [btn('Проверить', 'a:mtcheck', 'loading'), btn('Показать строку', 'a:mtexport', 'eye')] : null,
+      src === 'база' ? [btn('Удалить сессию', 'a:mtlogout', 'trash')] : null,
+      [back('admin')],
     ),
   };
 }
@@ -1107,7 +1295,8 @@ async function pushStatus(st) {
 function humanError(e) {
   const m = String(e?.message || e);
   if (m.includes('MTPROTO_NOT_CONFIGURED'))
-    return 'MTProto-сессия не настроена. Заполните API_ID, API_HASH и MTPROTO_SESSION (node bot.js login).';
+    return 'Аккаунт-вещатель не подключён. Админ-панель → Аккаунт-вещатель → Войти по номеру ' +
+           '(или задайте MTPROTO_SESSION в переменных окружения).';
   if (m.includes('PEER_NOT_FOUND'))
     return 'Аккаунт-вещатель не видит эту группу. Добавьте его в группу и сделайте администратором.';
   if (m.includes('CHAT_ADMIN_REQUIRED'))
@@ -1401,6 +1590,20 @@ bot.command('stats', async (ctx) => {
   await ctx.reply(v.text, { ...OPTS, reply_markup: v.kb });
 });
 
+/** Быстрый доступ к подключению аккаунта-вещателя (для хостингов без shell). */
+bot.command('login', async (ctx) => {
+  if (ctx.chat.type !== 'private') return;
+  if (!isOwner(ctx.from.id)) return ctx.reply(`${px('lock')} Команда только для администраторов бота.`, OPTS);
+  const v = viewMt();
+  await ctx.reply(v.text, { ...OPTS, reply_markup: v.kb });
+});
+
+bot.command('cancel', async (ctx) => {
+  wait.delete(ctx.from.id);
+  if (cancelMtLogin(ctx.from.id)) return ctx.reply(`${px('cross')} Вход отменён.`, OPTS);
+  await ctx.reply(`${px('check')} Отменено.`, OPTS);
+});
+
 /* ═══════════════════════════════════════════════════════════════════════════
    13. CALLBACK-РОУТЕР (инлайн-меню редактируется на месте)
    ═══════════════════════════════════════════════════════════════════════════ */
@@ -1680,6 +1883,78 @@ bot.on('callback_query:data', async (ctx) => {
         } else if (a === 'doctor') {
           const d = await doctor();
           await render(ctx, `<b>${px('code')} Диагностика</b>\n\n<code>${esc(d)}</code>`, kb([back('admin')]));
+
+        /* ── Аккаунт-вещатель ───────────────────────────────────────── */
+        } else if (a === 'mt') {
+          await show(ctx, viewMt());
+
+        } else if (a === 'mtlogin') {
+          if (ctx.chat?.type !== 'private')
+            return ctx.answerCallbackQuery({ text: '✖ Вход доступен только в личке с ботом', show_alert: true });
+          await ctx.answerCallbackQuery();
+          try {
+            await beginMtLogin(uid, ctx.chat.id);
+            await show(ctx, {
+              text: `<b>${px('loading')} Вход запущен</b>\n\nОтвечайте на вопросы сообщениями ниже.`,
+              kb: kb([btn('Отменить вход', 'a:mtcancel', 'cross')]),
+            });
+          } catch (e) {
+            const t = e.message === 'LOGIN_IN_PROGRESS' ? 'Вход уже идёт — завершите или отмените его.'
+              : e.message === 'NO_API_CREDENTIALS' ? 'Не заданы API_ID и API_HASH.'
+              : humanError(e);
+            await show(ctx, { text: `<b>${px('cross')} ${esc(t)}</b>`, kb: kb([back('a:mt')]) });
+          }
+
+        } else if (a === 'mtcancel') {
+          cancelMtLogin(uid);
+          await ctx.answerCallbackQuery({ text: '✖ Вход отменён' });
+          await show(ctx, viewMt());
+
+        } else if (a === 'mtpaste') {
+          wait.set(uid, { action: 'mtpaste' });
+          await ctx.answerCallbackQuery();
+          await show(ctx, {
+            text:
+              `<b>${px('clip')} Строка сессии</b>\n\n` +
+              `Пришлите готовую строку StringSession (получена командой <code>node bot.js login</code> ` +
+              `на любой машине с Node.js).\n\n` +
+              `${px('hidden')} Сообщение удалю сразу после проверки.`,
+            kb: kb([back('a:mt')]),
+          });
+
+        } else if (a === 'mtcheck') {
+          await ctx.answerCallbackQuery({ text: '⟳ Проверяю…' });
+          try {
+            resetMt();
+            const { client } = await getMt();
+            const me = await client.getMe();
+            await show(ctx, {
+              text: `<b>${px('check')} Сессия рабочая</b>\n\n${px('profile')} ${esc(me.firstName || '')}` +
+                    (me.username ? ` (@${esc(me.username)})` : '') + `\n<code>${me.id}</code>`,
+              kb: kb([back('a:mt')]),
+            });
+          } catch (e) {
+            await show(ctx, {
+              text: `<b>${px('cross')} Сессия не работает</b>\n\n<code>${esc(humanError(e))}</code>`,
+              kb: kb([btn('Войти заново', 'a:mtlogin', 'loading')], [back('a:mt')]),
+            });
+          }
+
+        } else if (a === 'mtexport') {
+          const str = sessionString();
+          if (!str) return ctx.answerCallbackQuery({ text: '✖ Сессии нет', show_alert: true });
+          await ctx.answerCallbackQuery();
+          await ctx.api.sendMessage(uid,
+            `<b>${px('lock')} Строка сессии</b>\n\n<code>${esc(str)}</code>\n\n` +
+            `${px('cross')} Это полный доступ к аккаунту. Перенесите её в переменную ` +
+            `<code>MTPROTO_SESSION</code> панели хостинга и удалите это сообщение.`, OPTS).catch(() => {});
+
+        } else if (a === 'mtlogout') {
+          Q.metaDel.run('mtproto_session');
+          Q.metaDel.run('mtproto_saved_at');
+          resetMt();
+          await ctx.answerCallbackQuery({ text: '✓ Сессия удалена' });
+          await show(ctx, viewMt());
         }
         break;
       }
@@ -1702,10 +1977,36 @@ bot.on('callback_query:data', async (ctx) => {
 
 bot.on('message:text', async (ctx) => {
   const uid = ctx.from.id;
+
+  // Шаги интерактивного входа в аккаунт-вещатель (номер / код / 2FA)
+  if (ctx.chat.type === 'private' && isOwner(uid) && mtLogin.has(uid)) {
+    if (feedMtLogin(uid, ctx.message.text)) {
+      await ctx.api.deleteMessage(ctx.chat.id, ctx.message.message_id).catch(() => {});
+      return;
+    }
+  }
+
   const st = wait.get(uid);
 
   if (st && ctx.chat.type === 'private') {
     wait.delete(uid);
+
+    if (st.action === 'mtpaste' && isOwner(uid)) {
+      const str = ctx.message.text.trim();
+      await ctx.api.deleteMessage(ctx.chat.id, ctx.message.message_id).catch(() => {});
+      const note = await ctx.reply(`<b>${px('loading')} Проверяю сессию…</b>`, OPTS);
+      try {
+        const me = await adoptSessionString(str);
+        return ctx.api.editMessageText(note.chat.id, note.message_id,
+          `<b>${px('check')} Сессия принята</b>\n\n${px('profile')} ${esc(me.firstName || '')}` +
+          (me.username ? ` (@${esc(me.username)})` : ''),
+          { ...OPTS, reply_markup: kb([btn('К вещателю', 'a:mt', 'settings')]) });
+      } catch (e) {
+        return ctx.api.editMessageText(note.chat.id, note.message_id,
+          `<b>${px('cross')} Строка не подошла</b>\n\n<code>${esc(humanError(e))}</code>`,
+          { ...OPTS, reply_markup: kb([btn('Ещё раз', 'a:mtpaste', 'loading')], [btn('Назад', 'a:mt')]) });
+      }
+    }
 
     if (st.action === 'add') {
       const url = extractUrl(ctx.message.text);
@@ -1819,12 +2120,13 @@ async function doctor() {
   lines.push(`BOT_TOKEN   : ${CFG.BOT_TOKEN ? 'задан' : '— ОТСУТСТВУЕТ —'}`);
   lines.push(`API_ID/HASH : ${CFG.API_ID && CFG.API_HASH ? 'заданы' : '— ОТСУТСТВУЮТ —'}`);
   try {
-    if (CFG.MTPROTO_SESSION) {
+    const src = sessionSource();
+    if (src) {
       const { client } = await getMt();
       const me = await client.getMe();
-      lines.push(`MTProto     : OK, @${me.username || me.id}`);
+      lines.push(`MTProto     : OK, @${me.username || me.id} (сессия: ${src})`);
     } else {
-      lines.push('MTProto     : — сессия не задана (node bot.js login) —');
+      lines.push('MTProto     : — сессии нет (админ-панель → Аккаунт-вещатель) —');
     }
   } catch (e) {
     lines.push(`MTProto     : ошибка — ${clip(e.message, 80)}`);
@@ -1876,6 +2178,7 @@ async function main() {
       { command: 'start', description: 'Открыть меню' },
       { command: 'help', description: 'Как это работает' },
       { command: 'stats', description: 'Статистика' },
+      { command: 'login', description: 'Подключить аккаунт-вещатель (админ)' },
     ],
     { scope: { type: 'all_private_chats' } },
   ).catch(() => {});
@@ -1893,10 +2196,11 @@ async function main() {
     { scope: { type: 'all_group_chats' } },
   ).catch(() => {});
 
-  if (CFG.MTPROTO_SESSION) {
+  if (sessionString()) {
     getMt().catch((e) => log('warn', 'MTProto не поднялся:', e.message));
   } else {
-    log('warn', 'MTPROTO_SESSION пуст — трансляции работать не будут (node bot.js login).');
+    log('warn', 'Сессия вещателя не задана — трансляции не заработают. ' +
+      'Войдите через админ-панель бота (Аккаунт-вещатель) или задайте MTPROTO_SESSION.');
   }
 
   await bot.start({
@@ -1935,6 +2239,7 @@ if (isEntry) {
 export {
   CFG, db, Q, E, px, btn, urlBtn, kb, bar, hhmmss, clip, esc, detectSource, extractUrl,
   canCopy, buildFfmpegArgs, formatSpec, QUALITY_PROFILE, humanError,
-  viewHome, viewChat, viewChats, viewQueue, viewSettings, viewHelp, viewProfile, viewStats,
+  viewHome, viewChat, viewChats, viewQueue, viewSettings, viewHelp, viewProfile, viewStats, viewMt, viewAdmin,
+  sessionString, sessionSource, beginMtLogin, feedMtLogin, cancelMtLogin, adoptSessionString,
   liveCard, startStream, stopStream, enqueue, doctor, live, bot,
 };
